@@ -1,38 +1,57 @@
 # Autonomous Coding Agent
 
+[![tests](https://github.com/weilun9/autonomous-coding-agent/actions/workflows/test.yml/badge.svg)](https://github.com/weilun9/autonomous-coding-agent/actions/workflows/test.yml)
+
 A small standalone coding agent built on the [Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk) (Python).
 You give it a goal ("build a CLI todo app with tests"); it works inside its own `workspace/` folder, commits locally,
-and **stops to ask you in the terminal before anything that would publish remotely** (`git push`, `gh pr create`,
-`npm publish`, ...). After each iteration it summarises what changed and waits for your next instruction.
+and **stops to ask you in the terminal before anything that would publish or reach a remote host** (`git push`,
+`gh pr create`, `npm publish`, `scp`, ...). After each iteration it summarises what changed and waits for your next
+instruction.
 
-The whole agent is one file, [`agent.py`](agent.py) (~150 lines).
+- [`agent.py`](agent.py): the agent loop and SDK wiring (~150 lines)
+- [`gate.py`](gate.py): the permission gate, plain Python with no SDK import, so it can be tested on its own
+- [`tests/`](tests): 74 table-driven command cases + file-tool and wiring tests, run in CI on Linux and Windows
 
 ## How a run works
 
 ```
-goal ─► Claude (system prompt: 9-step pipeline) ─► tool calls ─► permission callback ─► tool runs in workspace/
-                                                       ▲                  │
-                                                       └──── result ──────┘        ... until the iteration is done
-                                                                          │
-                                       push / publish command? ─► pause: "Allow this remote-affecting command? [y/N]"
+goal ─► Claude (system prompt: 9-step pipeline) ─► tool call ─► PreToolUse hook ─► gate.check()
+                                                                     │
+                       allow ◄──────────────────────────────────────┤
+                       deny  ◄── reason sent back to the model ─────┤
+                       ask   ─► can_use_tool ─► gate.check() again ─► "Allow this? [y/N]" in the terminal
 ```
 
-The system prompt asks the model to follow, every time:
+The system prompt asks the model to follow, every time: requirement analysis → design → implementation →
+self code review → structure check → security review of the workspace code only → local `git commit` →
+never publish on its own → summarise and wait.
 
-1. requirement analysis → 2. design → 3. implementation → 4. self code review → 5. structure check →
-6. security review of the workspace code only (e.g. `bandit`, `npm audit`; never external hosts) →
-7. local `git commit` → 8. never publish on its own initiative → 9. summarise and wait.
+## The permission gate
 
-## What is enforced in code, and what is only asked for in the prompt
+Every tool call goes through `gate.check()`; nothing can skip it:
 
-| Control | Where | How |
-|---|---|---|
-| File tools `Read`, `Write`, `Edit`, `Glob`, `Grep` run without prompting | code | `allowed_tools` in `ClaudeAgentOptions` (auto-approval list) |
-| Every `Bash` command is inspected before it runs | code | `bash_gate`, passed as the SDK's `can_use_tool` permission callback |
-| Destructive commands (`rm -rf /`, `mkfs`, `dd if=`, fork bomb, `shutdown`, ...) are refused | code | substring denylist in `bash_gate` |
-| Push / publish commands (`git push`, `gh pr create`, `gh repo create`, `gh release`, `npm publish`, `twine upload`, `git remote add`) wait for a typed `y` | code | `bash_gate` pauses and asks in the terminal |
-| Working directory is `workspace/` | code | `cwd` in `ClaudeAgentOptions` |
-| The 9-step pipeline, the scope of the security review, "never publish on your own" | prompt | `SYSTEM_PROMPT` (followed by the model, not checked) |
+| Layer | How |
+|---|---|
+| Only six tools exist: `Read`, `Write`, `Edit`, `Glob`, `Grep`, `Bash` | `tools=` in `ClaudeAgentOptions`; the gate also denies any other tool name (web, subagents, MCP) |
+| Nothing is pre-approved | `allowed_tools=[]`; `setting_sources=[]` so allow rules in `~/.claude` or project settings cannot bypass the gate |
+| The gate runs on every call | a `PreToolUse` hook with no matcher (the SDK skips `can_use_tool` for pre-approved calls, a hook does not) |
+| File tools stay inside `workspace/` | paths are resolved (`..`, `~`, symlinks, Git Bash `/c/...`) and must land inside the workspace; Glob patterns are checked by their fixed prefix |
+| Bash commands are parsed, not substring-matched | `shlex` tokens, split into simple commands on `; && \|\| \| & ( )` and newlines; `$( )`, backticks and `bash -c "..."` are checked recursively; heredoc bodies are treated as data; `cd` is tracked |
+
+What happens to a Bash command:
+
+| Result | Examples |
+|---|---|
+| **deny** | `sudo`; `mkfs`, `dd of=/dev/...`, `shutdown`; `rm`/`mv`/`cp`/`chmod`/redirects that touch anything outside the workspace (or delete the workspace itself); `curl ... \| sh`; `eval`; `xargs rm`; `find / -delete`; `git config --global`; fork bombs; commands that cannot be parsed |
+| **ask a person** | `git push` (in any form: `git -C . push`, `cd x && git push`, `$(git push)`), `git remote add`; `gh` commands that change something (`pr create`, `repo create`, `release`, `api -X POST`); `npm`/`twine`/`poetry`/`cargo publish`, `docker push`; `ssh`, `scp`, remote `rsync`; `curl`/`wget` uploads; global installs; commands in another shell's syntax (`powershell -Command`) |
+| **allow** | everything else: building, testing, linting, local git (`add`, `commit`, `log`, `status`), reading GitHub with `gh ... list/view`, downloads into the workspace |
+
+Quoted text is data: `git commit -m "fix push bug"` or `echo 'rm -rf /' > notes.txt` is allowed.
+
+**Compared with the first version** (substring matching on the raw command, file tools auto-approved): on the same
+74-command test table it classified 44 correctly and let 27 risky commands through, including `git -C . push`,
+`docker push`, `scp` and `gh api -X POST`; it also never checked `Write`/`Edit` paths at all. The table was written
+for this change, so treat it as a regression suite rather than proof that the gate is complete.
 
 ## Run
 
@@ -49,17 +68,14 @@ Enter to stop. To let it push or open PRs once you approve, log in first with `g
 
 `workspace/` is ignored by this repo: it becomes its own git repository the first time the agent runs `git init`.
 
+Tests (no API key needed): `python -m unittest discover -s tests -v`
+
 ## Known limits
 
-Written down on purpose; these are the next things to fix.
-
-- **Not a true tool allow-list.** `allowed_tools` only auto-approves the file tools. Other tools still reach
-  `bash_gate`, which currently allows anything that is not `Bash`. A strict version would deny every tool that is
-  not on an explicit list.
-- **String matching on raw commands can be bypassed.** `git -C . push`, extra spaces, or a script that pushes
-  would not match the patterns. Parsing the command (e.g. `shlex`) and checking the `git` subcommand would be stronger.
-  The denylist can also over-block (`rm -rf ./build` matches `rm -rf .`).
-- **File writes are not confined to `workspace/`.** `cwd` sets the starting folder; `Write` / `Edit` are not
-  path-checked.
+- **The gate checks commands, not what programs do once they run.** `bash script.sh`, `python -c "..."`, `make`,
+  `npm run` or a test suite can do anything the user account can. Real isolation needs an OS-level sandbox
+  (container, separate user, no credentials in the environment); the gate is a guard rail, not a sandbox.
+- **Reads inside the workspace are not limited,** and Bash commands such as `cat` are not path-checked (only
+  commands that write or delete are). The file tools themselves cannot read outside the workspace.
 - **The pipeline is a prompt, not a state machine.** Nothing verifies that the review steps actually ran.
-- **No automated tests yet**, and no recorded example runs in this repo.
+- **No recorded example runs** in this repo yet; the tests cover the gate and the wiring, not the model's behaviour.

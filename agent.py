@@ -4,6 +4,12 @@ Pipeline for every request: analyze requirements -> design -> implement ->
 self code review -> structure check -> security review -> local git commit
 -> (pause for human confirmation before any push/publish) -> iterate.
 
+Every tool call passes through gate.check() (see gate.py):
+  - only the tools in gate.ALLOWED_TOOLS exist (`tools=`), and no settings file can pre-approve anything
+    (`setting_sources=[]`, `allowed_tools=[]`);
+  - a PreToolUse hook runs the gate on *every* call and allows, denies, or escalates to "ask";
+  - "ask" reaches `can_use_tool`, which asks a person in the terminal.
+
 Usage:
     python agent.py "build a CLI todo app in Python"
     python agent.py                      # prompts for the goal interactively
@@ -20,6 +26,7 @@ from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKClient,
+    HookMatcher,
     TextBlock,
 )
 from claude_agent_sdk.types import (
@@ -27,6 +34,8 @@ from claude_agent_sdk.types import (
     PermissionResultDeny,
     ToolPermissionContext,
 )
+
+import gate
 
 WORKSPACE = Path(__file__).parent / "workspace"
 
@@ -42,32 +51,10 @@ SYSTEM_PROMPT = """You are an autonomous software engineering agent. For every r
 8. Never publish anything remotely on your own initiative. Commands like `git push`, `gh pr create`, `gh repo create`, or anything that publishes to a remote/public destination will be paused by the harness for a human to confirm -- just run them normally when you believe the work is ready to share, and the confirmation happens outside your control.
 9. After finishing an iteration, summarize what changed and suggest the next improvement, then stop and wait for further instructions.
 
+You can only use these tools: Read, Write, Edit, Glob, Grep, Bash. All paths must stay inside the current working directory;
+calls outside it are refused. If a tool call is refused, read the reason and adjust instead of retrying the same call.
 If requirements are ambiguous, state a reasonable assumption and proceed -- do not stall waiting for clarification unless the ambiguity is safety-critical.
 """
-
-DANGEROUS_PATTERNS = [
-    "rm -rf /",
-    "rm -rf ~",
-    "rm -rf .",
-    "mkfs",
-    ":(){:|:&};:",
-    "dd if=",
-    "> /dev/sd",
-    "shutdown",
-    "reboot",
-    "del /f /s /q c:",
-]
-
-REMOTE_ACTION_PATTERNS = [
-    "git push",
-    "gh pr create",
-    "gh repo create",
-    "gh release",
-    "npm publish",
-    "pip upload",
-    "twine upload",
-    "git remote add",
-]
 
 
 async def confirm(prompt: str) -> bool:
@@ -76,28 +63,32 @@ async def confirm(prompt: str) -> bool:
     return answer.strip().lower() in ("y", "yes")
 
 
-async def bash_gate(
+async def pre_tool_gate(input_data, tool_use_id, context) -> dict:
+    """PreToolUse hook: runs on every tool call, before any permission rule."""
+    decision = gate.check(input_data["tool_name"], input_data.get("tool_input") or {}, WORKSPACE)
+    if decision.action == "allow":
+        return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow"}}
+    if decision.action == "deny":
+        print(f"\n[blocked] {input_data['tool_name']}: {decision.reason}")
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                                   "permissionDecision": decision.action,
+                                   "permissionDecisionReason": decision.reason}}
+
+
+async def ask_person(
     tool_name: str,
     input_data: dict,
     context: ToolPermissionContext,
 ) -> PermissionResultAllow | PermissionResultDeny:
-    if tool_name != "Bash":
-        return PermissionResultAllow(updated_input=input_data)
-
-    cmd = input_data.get("command", "")
-    lower = cmd.lower()
-
-    if any(p in lower for p in DANGEROUS_PATTERNS):
-        return PermissionResultDeny(
-            message=f"Blocked potentially destructive command: {cmd}"
-        )
-
-    if any(p in lower for p in REMOTE_ACTION_PATTERNS):
-        print(f"\n[confirm] The agent wants to run:\n  {cmd}\n")
-        if await confirm("Allow this remote-affecting command? [y/N]: "):
-            return PermissionResultAllow(updated_input=input_data)
-        return PermissionResultDeny(message="User declined to run this command.")
-
+    """Reached only for calls the gate marked "ask". The gate runs again first as a second check."""
+    decision = gate.check(tool_name, input_data, WORKSPACE)
+    if decision.action == "deny":
+        return PermissionResultDeny(message=decision.reason)
+    if decision.action == "ask":
+        detail = input_data.get("command") or input_data
+        print(f"\n[confirm] {decision.reason}\n  {detail}\n")
+        if not await confirm("Allow this? [y/N]: "):
+            return PermissionResultDeny(message="A person declined this action.")
     return PermissionResultAllow(updated_input=input_data)
 
 
@@ -111,6 +102,19 @@ def render(message) -> None:
                 print(f"[{type(block).__name__}] {name}")
 
 
+def build_options() -> ClaudeAgentOptions:
+    return ClaudeAgentOptions(
+        system_prompt=SYSTEM_PROMPT,
+        cwd=str(WORKSPACE),
+        tools=list(gate.ALLOWED_TOOLS),      # the only tools that exist in this session
+        allowed_tools=[],                    # nothing is pre-approved; every call goes through the gate
+        setting_sources=[],                  # ignore ~/.claude and project settings (their allow rules would bypass the gate)
+        permission_mode="default",
+        hooks={"PreToolUse": [HookMatcher(matcher=None, hooks=[pre_tool_gate])]},
+        can_use_tool=ask_person,
+    )
+
+
 async def main() -> None:
     WORKSPACE.mkdir(exist_ok=True)
 
@@ -121,15 +125,7 @@ async def main() -> None:
         print("No goal given, exiting.")
         return
 
-    options = ClaudeAgentOptions(
-        system_prompt=SYSTEM_PROMPT,
-        cwd=str(WORKSPACE),
-        allowed_tools=["Read", "Write", "Edit", "Glob", "Grep"],
-        permission_mode="default",
-        can_use_tool=bash_gate,
-    )
-
-    async with ClaudeSDKClient(options=options) as client:
+    async with ClaudeSDKClient(options=build_options()) as client:
         prompt = goal
         while True:
             await client.query(prompt)
