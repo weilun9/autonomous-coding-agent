@@ -59,9 +59,16 @@ for this change, so treat it as a regression suite rather than proof that the ga
 python -m venv .venv
 .venv\Scripts\activate             # Linux/macOS: source .venv/bin/activate
 pip install -r requirements.txt
-set ANTHROPIC_API_KEY=sk-ant-...   # or copy .env.example to .env
 python agent.py "build a CLI todo app in Python with tests"
 ```
+
+Authentication, either:
+- **your own Claude login:** log in once with `claude` (Claude Code CLI) and leave `ANTHROPIC_API_KEY` unset. The run is
+  billed to that account; whether it uses plan limits or prepaid credits depends on the plan, and an account without
+  either stops at the first call with "Credit balance is too low". For personal use only: Anthropic does not allow
+  offering Claude.ai login to other people through an app built on the Agent SDK;
+- **an API key:** `set ANTHROPIC_API_KEY=sk-ant-...` (or copy `.env.example` to `.env` and load it); billed per token.
+  If both are present, the API key wins.
 
 Run it with no argument and it asks for the goal. After each iteration, type a follow-up instruction, or press
 Enter to stop. To let it push or open PRs once you approve, log in first with `gh auth login`.

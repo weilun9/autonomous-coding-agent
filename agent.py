@@ -14,8 +14,9 @@ Usage:
     python agent.py "build a CLI todo app in Python"
     python agent.py                      # prompts for the goal interactively
 
-Requires:
-    ANTHROPIC_API_KEY set in the environment (or an `ant auth login` profile).
+Requires either:
+    a Claude Code login (`claude` CLI, personal use; billed to that account), with ANTHROPIC_API_KEY unset, or
+    ANTHROPIC_API_KEY set in the environment (billed per token; wins if both are present).
 """
 
 import asyncio
